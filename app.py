@@ -23,18 +23,18 @@ if "history" not in st.session_state:
 st.title("🏢 Insurellm Expert Assistant")
 st.caption("Ask anything about Insurellm. Left = chat. Right = retrieved context.")
 
-top_col1, top_col2 = st.columns([1, 1])
+# top_col1, top_col2 = st.columns([1, 1])
 
-with top_col1:
-    if st.button("📥 Ingest knowledge base now", use_container_width=True):
-        with st.spinner("Ingesting documents into Chroma..."):
-            docs = fetch_documents()
-            chunks = create_chunks(docs)
-            create_embeddings(chunks)
-        st.success("Ingestion complete. Your vector DB is updated.")
+# with top_col1:
+#     if st.button("📥 Ingest knowledge base now", use_container_width=True):
+#         with st.spinner("Ingesting documents into Chroma..."):
+#             docs = fetch_documents()
+#             chunks = create_chunks(docs)
+#             create_embeddings(chunks)
+#         st.success("Ingestion complete. Your vector DB is updated.")
 
-with top_col2:
-    st.info("If retrieval looks wrong, you probably ingested with different embeddings than you query with. Set `EMBEDDINGS_PROVIDER` consistently in `.env`.")
+# with top_col2:
+#     st.info("If retrieval looks wrong, you probably ingested with different embeddings than you query with. Set `EMBEDDINGS_PROVIDER` consistently in `.env`.")
 
 col_chat, col_ctx = st.columns([1, 1], gap="large")
 
