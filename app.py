@@ -2,7 +2,6 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from implementation.answer import answer_question
-from implementation.ingest import fetch_documents, create_chunks, create_embeddings
 
 load_dotenv(override=True)
 
