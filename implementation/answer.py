@@ -1,19 +1,21 @@
+from __future__ import annotations
+
+import os
 from pathlib import Path
+
 from dotenv import load_dotenv
-from chromadb import PersistentClient
-from litellm import completion
-from pydantic import BaseModel, Field
 from tenacity import retry, wait_exponential
+from pydantic import BaseModel, Field
+
+from chromadb import PersistentClient
 from sentence_transformers import SentenceTransformer
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
 load_dotenv(override=True)
 
-# =========================
-# Configuration
-# =========================
-
-MODEL = "groq/openai/gpt-oss-120b"
-
+MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
 DB_NAME = str(Path(__file__).parent.parent / "vector_db_v2")
 COLLECTION_NAME = "docs"
 
@@ -22,44 +24,28 @@ FINAL_K = 10
 
 WAIT = wait_exponential(multiplier=1, min=10, max=240)
 
-# =========================
-# Embeddings (FREE, consistent with ingest)
-# =========================
+llm = ChatOpenAI(
+    model_name=MODEL,
+    temperature=0,
+    base_url=os.getenv("OPENAI_BASE_URL"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+)
 
+# ✅ free embeddings only
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-# =========================
-# Vector DB
-# =========================
 
 chroma = PersistentClient(path=DB_NAME)
 collection = chroma.get_or_create_collection(COLLECTION_NAME)
 
-# =========================
-# Prompts
-# =========================
 
 SYSTEM_PROMPT = """
 You are a knowledgeable assistant representing the company Insurellm.
-You must answer the user's question using ONLY the provided context.
-Your answer will be evaluated for accuracy, relevance, and completeness.
-
-If the context does not contain the answer, say you do not know.
+Answer using ONLY the provided context. If the context doesn't contain the answer, say you don't know.
 
 Context:
 {context}
-"""
+""".strip()
 
-RERANK_SYSTEM_PROMPT = """
-You are a document re-ranker.
-You are given a question and multiple text chunks.
-Rank all chunks by relevance to the question, from most relevant to least relevant.
-Reply ONLY with the ordered list of chunk IDs.
-"""
-
-# =========================
-# Models
-# =========================
 
 class Result(BaseModel):
     page_content: str
@@ -67,21 +53,13 @@ class Result(BaseModel):
 
 
 class RankOrder(BaseModel):
-    order: list[int] = Field(
-        description="Chunk IDs ranked from most relevant to least relevant"
-    )
+    order: list[int] = Field(description="Chunk IDs ranked most relevant to least relevant")
 
-# =========================
-# Query Rewriting
-# =========================
 
 @retry(wait=WAIT)
 def rewrite_query(question: str, history: list[dict] | None = None) -> str:
     history = history or []
-
     prompt = f"""
-You are answering questions about the company Insurellm.
-
 Conversation history:
 {history}
 
@@ -89,90 +67,59 @@ User question:
 {question}
 
 Rewrite the question into a short, precise knowledge-base search query.
-Respond ONLY with the rewritten query.
-"""
+Return ONLY the rewritten query.
+""".strip()
 
-    response = completion(
-        model=MODEL,
-        messages=[{"role": "system", "content": prompt}],
-    )
-    return response.choices[0].message.content.strip()
+    resp = llm.invoke([SystemMessage(content=prompt)]).content
+    return resp.strip()
 
-# =========================
-# Retrieval
-# =========================
 
 def fetch_context_unranked(query_text: str) -> list[Result]:
-    query_embedding = embedder.encode(
-        query_text, normalize_embeddings=True
-    ).tolist()
+    qvec = embedder.encode(query_text, normalize_embeddings=True).tolist()
+    res = collection.query(query_embeddings=[qvec], n_results=RETRIEVAL_K)
 
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=RETRIEVAL_K,
-    )
-
-    chunks: list[Result] = []
-    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+    chunks = []
+    for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
         chunks.append(Result(page_content=doc, metadata=meta))
-
     return chunks
 
 
-def merge_chunks(primary: list[Result], secondary: list[Result]) -> list[Result]:
+def merge_chunks(a: list[Result], b: list[Result]) -> list[Result]:
     seen = set()
     merged = []
-
-    for chunk in primary + secondary:
-        key = chunk.page_content
-        if key not in seen:
-            seen.add(key)
-            merged.append(chunk)
-
+    for c in a + b:
+        if c.page_content not in seen:
+            seen.add(c.page_content)
+            merged.append(c)
     return merged
 
-# =========================
-# Reranking
-# =========================
 
 @retry(wait=WAIT)
 def rerank(question: str, chunks: list[Result]) -> list[Result]:
-    user_prompt = f"Question:\n{question}\n\nChunks:\n"
+    sys = """
+You are a document re-ranker.
+Given a question and chunks with IDs, return ONLY JSON:
+{"order":[id1,id2,...]} containing ALL ids ranked most relevant to least.
+""".strip()
 
-    for idx, chunk in enumerate(chunks, start=1):
-        user_prompt += f"\n# CHUNK {idx}\n{chunk.page_content}\n"
+    user = f"Question:\n{question}\n\nChunks:\n"
+    for i, c in enumerate(chunks, start=1):
+        user += f"\n# CHUNK ID {i}\n{c.page_content}\n"
 
-    messages = [
-        {"role": "system", "content": RERANK_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ]
+    resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=user)]).content.strip()
 
-    response = completion(
-        model=MODEL,
-        messages=messages,
-        response_format=RankOrder,
-    )
+    # very simple JSON extraction
+    start = resp.find("{")
+    end = resp.rfind("}")
+    if start == -1 or end == -1:
+        return chunks  # fallback: keep original order
 
-    order = RankOrder.model_validate_json(
-        response.choices[0].message.content
-    ).order
-
-    return [chunks[i - 1] for i in order if 0 < i <= len(chunks)]
-
-# =========================
-# RAG Assembly
-# =========================
-
-def fetch_context(question: str, history: list[dict]) -> list[Result]:
-    rewritten = rewrite_query(question, history)
-
-    original_chunks = fetch_context_unranked(question)
-    rewritten_chunks = fetch_context_unranked(rewritten)
-
-    merged = merge_chunks(original_chunks, rewritten_chunks)
-    reranked = rerank(question, merged)
-
-    return reranked[:FINAL_K]
+    import json
+    try:
+        order = RankOrder.model_validate(json.loads(resp[start:end+1])).order
+        return [chunks[i - 1] for i in order if 0 < i <= len(chunks)]
+    except Exception:
+        return chunks
 
 
 def make_rag_messages(question: str, history: list[dict], chunks: list[Result]):
@@ -180,29 +127,37 @@ def make_rag_messages(question: str, history: list[dict], chunks: list[Result]):
         f"Source: {c.metadata.get('source', 'unknown')}\n{c.page_content}"
         for c in chunks
     )
+    sys = SYSTEM_PROMPT.format(context=context)
 
-    system_prompt = SYSTEM_PROMPT.format(context=context)
+    msgs = [SystemMessage(content=sys)]
+    # history is dicts like {"role":"user","content":"..."} already from streamlit
+    for h in history:
+        role = h.get("role")
+        content = h.get("content", "")
+        if role == "user":
+            msgs.append(HumanMessage(content=content))
+        else:
+            # treat any non-user as assistant context
+            from langchain_core.messages import AIMessage
+            msgs.append(AIMessage(content=content))
 
-    return (
-        [{"role": "system", "content": system_prompt}]
-        + history
-        + [{"role": "user", "content": question}]
-    )
+    msgs.append(HumanMessage(content=question))
+    return msgs
 
-# =========================
-# Public API
-# =========================
+
+def fetch_context(question: str, history: list[dict]) -> list[Result]:
+    rewritten = rewrite_query(question, history)
+    c1 = fetch_context_unranked(question)
+    c2 = fetch_context_unranked(rewritten)
+    merged = merge_chunks(c1, c2)
+    reranked = rerank(question, merged)
+    return reranked[:FINAL_K]
+
 
 @retry(wait=WAIT)
 def answer_question(question: str, history: list[dict] | None = None):
     history = history or []
-
     chunks = fetch_context(question, history)
-    messages = make_rag_messages(question, history, chunks)
-
-    response = completion(
-        model=MODEL,
-        messages=messages,
-    )
-
-    return response.choices[0].message.content, chunks
+    msgs = make_rag_messages(question, history, chunks)
+    resp = llm.invoke(msgs).content
+    return resp, chunks
