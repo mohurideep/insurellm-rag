@@ -98,6 +98,61 @@ def run():
     print(json.dumps(report["summary"], indent=2))
     print(f"\nSaved: {REPORT_PATH}")
 
+def evaluate_iter():
+    """
+    Generator version of evaluation:
+    yields (index, total, test, row_dict)
+    """
+    tests = load_tests()
+    total = len(tests)
+
+    for i, t in enumerate(tests, start=1):
+        pred, ctx = answer_question(t.question, history=[])
+
+        hits = keyword_hits_in_context(t.keywords, ctx)
+        recall = sum(hits.values()) / max(len(hits), 1)
+
+        a_vec = embedder.encode(pred, normalize_embeddings=True)
+        r_vec = embedder.encode(t.reference_answer, normalize_embeddings=True)
+        sim = cosine_sim(a_vec, r_vec)
+
+        row = EvalRow(
+            question=t.question,
+            category=t.category,
+            reference_answer=t.reference_answer,
+            predicted_answer=pred,
+            keyword_hits=hits,
+            keyword_recall=recall,
+            answer_ref_cosine=sim,
+            passed_retrieval=(recall >= 0.8),
+        )
+
+        yield i, total, t, asdict(row)
+
+
+def run_and_return_report():
+    """
+    Runs full eval and returns report dict (same as saved JSON)
+    """
+    rows = []
+    for _, _, _, row in evaluate_iter():
+        rows.append(row)
+
+    avg_recall = sum(r["keyword_recall"] for r in rows) / max(len(rows), 1)
+    avg_sim = sum(r["answer_ref_cosine"] for r in rows) / max(len(rows), 1)
+    retrieval_pass_rate = sum(1 for r in rows if r["passed_retrieval"]) / max(len(rows), 1)
+
+    report = {
+        "summary": {
+            "num_tests": len(rows),
+            "avg_keyword_recall": avg_recall,
+            "avg_answer_ref_cosine": avg_sim,
+            "retrieval_pass_rate": retrieval_pass_rate,
+        },
+        "rows": rows,
+    }
+    return report
+
 
 if __name__ == "__main__":
     run()
